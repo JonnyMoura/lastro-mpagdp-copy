@@ -5,6 +5,8 @@
 
 from flask import Flask, Response, jsonify, request
 import json
+from dotenv import load_dotenv
+load_dotenv()
 
 from dataGen.queries import handleQuery
 from dataGen.suggestions import getSuggestions
@@ -18,7 +20,6 @@ from utilities.cors.setup import initCors
 from utilities.ratelimit.setup import initRateLimiter, limiter
 
 app = Flask(__name__)
-
 initDatabase(app)
 initCors(app)
 initRateLimiter(app)
@@ -30,7 +31,13 @@ initScheduler(app)
 
 @app.route('/projects', methods=['GET'])
 def get_projects():
-    data = [project.serialize() for project in Project.query.all()]
+    projects = Project.query.all()
+    data = []
+    for project in projects:
+        try:
+            data.append(project.serialize())
+        except Exception as e:
+            print(f"Error serializing project {project.id}: {e}")
     json_str = json.dumps(data, ensure_ascii=False, indent=2)
     return Response(json_str, mimetype='application/json; charset=utf-8')
 
@@ -38,12 +45,7 @@ def get_projects():
 def get_project(project_id):
     return jsonify(Project.query.get_or_404(project_id).serialize())
 
-@app.route('/random-projects/<int:count>', methods=['GET'])
-def get_random_projects(count):
-    from sqlalchemy import func
-    data = [project.serialize() for project in Project.query.order_by(func.random()).limit(min(count,Project.query.count())).all()]
-    json_str = json.dumps(data, ensure_ascii=False, indent=2)
-    return Response(json_str, mimetype='application/json; charset=utf-8')
+
 
 @app.route('/suggestions/<int:project_id>', methods=['GET'])
 def get_suggestions(project_id):
@@ -89,13 +91,18 @@ def home():
     </style>
     <body>Lastro Backend is running!</body>
     """
-    
+
+@app.route('/project-count', methods=['GET'])
+def get_project_count():
+    count = Project.query.count()
+    return jsonify({"project_count": count})
+
 # ==================================================
 # main
 # ==================================================
 
 if __name__ == '__main__':
     try:
-        app.run(debug=True, use_reloader=False)
+        app.run(debug=True, use_reloader=True)
     finally:
         cleanScheduler()

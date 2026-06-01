@@ -97,7 +97,8 @@ def create_model():
             ['ollama', 'create', CUSTOM_MODEL_NAME, '-f', 'Modelfile'],
             capture_output=True,
             text=True,
-            check=True
+            check=True,
+            encoding='utf-8'
         )
         print(f"✅ Model '{CUSTOM_MODEL_NAME}' created successfully!")
         

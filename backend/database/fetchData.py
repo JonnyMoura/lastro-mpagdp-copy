@@ -115,9 +115,8 @@ def insertProject(pid, p, cleanedLink, lineIndex, reporter):
         link=cleanedLink,
         title= p['Tema'] if isinstance(p['Tema'], str) else '',
         author=p['Nome'] if isinstance(p['Nome'], str) else '',
-        category=normalizeString(p['Categorias']),
         date=date,
-
+        category=p['Categoria'] if isinstance(p['Categoria'], str) else '',
         direction=normalizeString(p['Realizador']),
         sound=normalizeString(p['Som']),
         production = normalizeString(p['Produção']),
@@ -125,12 +124,16 @@ def insertProject(pid, p, cleanedLink, lineIndex, reporter):
         assistance = normalizeString(p['Assistência']),
         research = normalizeString(p['Pesquisa']),
         
-        location=concatStrings([p['Região'],p['Distrito/Ilha'],p['Concelho'],p['Local']]),
-
+        location=p['Local'] if isinstance(p['Local'], str) else '',
+        municipality=p['Concelho'] if isinstance(p['Concelho'], str) else '',
+        district=p['Distrito/Ilha'] if isinstance(p['Distrito/Ilha'], str) else '',
+        region=p['Região'] if isinstance(p['Região'], str) else '',
         instruments = normalizeString(p['Instrumentos']),
         
-        keywords = normalizeString(concatStrings([p['Palavras Chave'],p['Conceitos-chave']]), capitalize_keywords=True),
-        infoPool = concatStrings([p['História (textos que acompanham vídeos)'],p['Outras Informações'],p['Biografias']])
+        keywords = normalizeString(concatStrings([p['Palavras-chave'],p['Conceitos-chave']]), capitalize_keywords=True),
+        history = p['História (textos que acompanham vídeos)'] if isinstance(p['História (textos que acompanham vídeos)'], str) else '',
+        other_info = p['Outras Informações'] if isinstance(p['Outras Informações'], str) else '',
+        biographies = p['Biografias'] if isinstance(p['Biografias'], str) else ''
     )
 
     db.session.add(newProject)
@@ -148,21 +151,25 @@ def updateProject(existingProject, p, lineIndex, cleanedLink, reporter):
         ('title', p['Tema'] if isinstance(p['Tema'], str) else ''),
         ('author', p['Nome'] if isinstance(p['Nome'], str) else ''),
         ('link', cleanedLink),
-        ('category',normalizeString(p['Categorias'])),
-
+        ('category', p['Categoria'] if isinstance(p['Categoria'], str) else ''),
         ('direction', normalizeString(p['Realizador'])),
         ('sound', normalizeString(p['Som'])),
         ('production', normalizeString(p['Produção'])),
         ('support', normalizeString(p['Apoio'])),
         ('assistance', normalizeString(p['Assistência'])),
         ('research', normalizeString(p['Pesquisa'])),
-        
-        ('location', concatStrings([p['Região'],p['Distrito/Ilha'],p['Concelho'],p['Local']])),
+        ('location', p['Local'] if isinstance(p['Local'], str) else ''),
+        ('municipality', p['Concelho'] if isinstance(p['Concelho'], str) else ''),
+        ('district', p['Distrito/Ilha'] if isinstance(p['Distrito/Ilha'], str) else ''),
+        ('region', p['Região'] if isinstance(p['Região'], str) else ''),
+        ('instruments', normalizeString(p['Instrumentos'])),
         
         ('instruments', normalizeString(p['Instrumentos'])),
         
-        ('keywords', normalizeString(concatStrings([p['Palavras Chave'],p['Conceitos-chave']]), capitalize_keywords=True)),
-        ('infoPool', concatStrings([p['História (textos que acompanham vídeos)'],p['Outras Informações'],p['Biografias']]))
+        ('keywords', normalizeString(concatStrings([p['Palavras-chave'],p['Conceitos-chave']]), capitalize_keywords=True)),
+        ('history', p['História (textos que acompanham vídeos)'] if isinstance(p['História (textos que acompanham vídeos)'], str) else ''),
+        ('other_info', p['Outras Informações'] if isinstance(p['Outras Informações'], str) else ''),
+        ('biographies', p['Biografias'] if isinstance(p['Biografias'], str) else '')
     ]
 
     # avoid unecessary access to Vimeo API
@@ -204,10 +211,14 @@ def fetchCSV():
     visitedIds = {}
     duplicateIds = {} 
 
-    # fetch CSV data (certificates handle), UTF-8 encoding not to loose chars like 'Ç'
-    response = requests.get(GOOGLE_SHEETS_URL)
-    response.raise_for_status()
-    response.encoding = 'utf-8'
+    try:
+        # fetch CSV data (certificates handle), UTF-8 encoding not to loose chars like 'Ç'
+        response = requests.get(GOOGLE_SHEETS_URL)
+        response.raise_for_status()
+        response.encoding = 'utf-8'
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching CSV: {e}")
+        return {"error": str(e)}, 500
 
     df = pd.read_csv(StringIO(response.text))
 
@@ -253,6 +264,9 @@ def fetchCSV():
         else:
             reporter.flushUnchangedBatch()
             insertProject(pid, p, cleanedLink, lineIndex, reporter)
+        
+        if lineIndex % 100 == 0:
+            db.session.commit()
         
     reporter.flushNanBatch()
     reporter.addDuplicateSummary(duplicateIds)

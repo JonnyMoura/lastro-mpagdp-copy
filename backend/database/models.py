@@ -47,14 +47,18 @@ class Project(db.Model):
     research = db.Column(db.String(256))
 
     # geo info
-    location = db.Column(db.String(512))
-
+    location   = db.Column(db.String)
+    municipality = db.Column(db.String)
+    district   = db.Column(db.String)
+    region     = db.Column(db.String)
     # instruments
     instruments = db.Column(db.String(256))
 
     # other info
     keywords = db.Column(db.String(1024))
-    infoPool = db.Column(db.String(2048))
+    history = db.Column(db.String(2048))
+    other_info = db.Column(db.String(2048))
+    biographies = db.Column(db.String(2048))
 
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -75,11 +79,16 @@ class Project(db.Model):
             "research": self.research,
 
             "location": self.location,
+            "municipality": self.municipality,
+            "district": self.district,
+            "region": self.region,
 
             "instruments": self.instruments,
 
             "keywords": self.keywords,
-            "infoPool": self.infoPool,
+            "history": self.history,
+            "other_info": self.other_info,
+            "biographies": self.biographies,
 
             "created_at": self.created_at.isoformat() if self.created_at else None
         }

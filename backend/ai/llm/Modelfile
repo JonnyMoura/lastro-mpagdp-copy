@@ -39,6 +39,7 @@ Examples (COMPARISON - returns -equal or -different):
 "local diferente" -> location-different
 "noutro sítio" -> location-different
 "neste sítio" -> location-equal
+"no mesmo sítio" -> location-equal
 "mesma data" -> date-equal
 "outros projetos neste ano" -> date-equal
 "data diferente" -> date-different
