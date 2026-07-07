@@ -7,6 +7,7 @@ import math
 import sqlite3
 import igraph as ig
 import leidenalg
+import sys
 
 
 def create_knowledge_graph_from_data(data_rows):
@@ -27,6 +28,9 @@ def create_knowledge_graph_from_data(data_rows):
             for cat in row['Categoria'].split(','):
                 node_counts[cat.strip()] += 1
         if row.get('Local'): node_counts[row.get('Local')] += 1
+        if row.get('keywords'):
+            for keyword in row['keywords'].split(','):
+                node_counts[keyword.strip()] += 1
 
     total_rows = len(data_rows)
 
@@ -57,6 +61,20 @@ def create_knowledge_graph_from_data(data_rows):
                 node = (name, 'Category')
                 if not G.has_node(node): G.add_node(node, type='Category', name=name)
                 G.add_edge(artist_node, node, relationship='in_category', weight=get_weight(name))
+
+        if row.get('keywords'):
+            for name in [k.strip() for k in row['keywords'].split(',') if k.strip()]:
+                node = (name, 'Keyword')
+                if not G.has_node(node): G.add_node(node, type='Keyword', name=name)
+                G.add_edge(artist_node, node, relationship='has_keyword', weight=get_weight(name))
+
+        # Add history, other_info, and biographies as attributes to the artist node
+        if row.get('history'):
+            G.nodes[artist_node]['history'] = row['history']
+        if row.get('other_info'):
+            G.nodes[artist_node]['other_info'] = row['other_info']
+        if row.get('biographies'):
+            G.nodes[artist_node]['biographies'] = row['biographies']
 
         local_name    = row.get('Local')
         concelho_name = row.get('Concelho')
@@ -131,6 +149,7 @@ def build_relationships_dict(graph):
         'Municipality': 'municipalities',
         'District':     'districts',
         'Region':       'regions',
+        'Keyword':      'keywords',
     }
 
     artist_relationships = {}   # artist_name  -> {type_key: [names]}
@@ -142,6 +161,14 @@ def build_relationships_dict(graph):
 
         artist_name = data.get('name', '')
         entry = {key: [] for key in TYPE_KEY.values()}
+        
+        # Add node attributes to the entry
+        if 'history' in data:
+            entry['history'] = data['history']
+        if 'other_info' in data:
+            entry['other_info'] = data['other_info']
+        if 'biographies' in data:
+            entry['biographies'] = data['biographies']
 
         for neighbor in graph.neighbors(node):
             neighbor_data = graph.nodes[neighbor]
@@ -169,9 +196,10 @@ def build_relationships_dict(graph):
                             current = hop  # advance up the chain
                             break
 
-        # Deduplicate while preserving order
-        for key in entry:
-            entry[key] = list(dict.fromkeys(entry[key]))
+        # Deduplicate list-based fields while preserving order
+        for key in TYPE_KEY.values():
+            if key in entry and isinstance(entry[key], list):
+                entry[key] = list(dict.fromkeys(entry[key]))
 
         artist_relationships[artist_name] = entry
         name_to_artists[artist_name.lower()].add(artist_name)
@@ -179,105 +207,180 @@ def build_relationships_dict(graph):
     return artist_relationships, dict(name_to_artists)
 
 
-def build_leiden_communities(graph, resolution=1.0):
+def build_artist_projection(graph, entity_types=None, max_entity_share=0.10):
     """
-    Runs the Leiden algorithm on the NetworkX graph and returns a list of
-    community objects, each being a dict with:
+    Projects the heterogeneous knowledge graph onto an artist-artist similarity
+    graph. Two artists share an edge if they have common entities, weighted by
+    the inverse of how many artists share each entity (rarity bonus).
 
-        {
-            "id":        int,                  # community index
-            "artists":   [str, ...],           # artist names in this community
-            "tokens":    set[str],             # pooled lowercase token bag for retrieval
-            "summary":   str,                  # human-readable label for the LLM prompt
-        }
+    Excludes geographic nodes by default so communities reflect musical/thematic
+    similarity rather than physical proximity.
 
-    Why Leiden over Louvain?
-    - Leiden guarantees well-connected partitions (no disconnected communities).
-    - It is faster and more stable across runs at the same resolution.
-    - With edge weights from the TF-IDF-like scoring in the graph, it naturally
-      clusters artists that share rare instruments, themes, or locations.
-
-    The `resolution` parameter controls granularity:
-    - Higher  → more, smaller communities  (fine-grained clusters)
-    - Lower   → fewer, larger communities  (broad regional/stylistic groups)
-    A value around 0.8–1.2 works well for typical dataset sizes here.
-
-    Returns: list[dict]  (empty list if the graph has no edges)
+    Entities shared by more than max_entity_share fraction of all artists are
+    dropped (e.g. 'voz') — they add noise without signal.
     """
-    if graph.number_of_edges() == 0:
-        return []
+    if entity_types is None:
+        entity_types = {'Theme', 'Instrument', 'Category', 'Keyword', 'Location'}
 
-    # --- 1. Convert NetworkX → igraph, preserving edge weights ---
-    # igraph needs integer node ids; we map tuples to ints via a list.
-    nx_nodes  = list(graph.nodes())
+    entity_to_artists = defaultdict(set)
+    artist_nodes = set()
+    for node, data in graph.nodes(data=True):
+        if data.get('type') != 'Artist':
+            continue
+        artist_nodes.add(node)
+        for neighbor in graph.neighbors(node):
+            ndata = graph.nodes[neighbor]
+            if ndata.get('type') in entity_types:
+                entity_to_artists[neighbor].add(node)
+
+    n_artists = len(artist_nodes)
+    threshold = int(n_artists * max_entity_share)
+
+    proj = nx.Graph()
+    for node in artist_nodes:
+        proj.add_node(node, **graph.nodes[node])
+
+    for _, artists in entity_to_artists.items():
+        if len(artists) > threshold:
+            continue
+        rarity = 1.0 / len(artists)
+        artists_list = list(artists)
+        for i in range(len(artists_list)):
+            for j in range(i + 1, len(artists_list)):
+                a, b = artists_list[i], artists_list[j]
+                if proj.has_edge(a, b):
+                    proj[a][b]['weight'] += rarity
+                else:
+                    proj.add_edge(a, b, weight=rarity)
+
+    return proj
+
+
+def _run_leiden(graph, resolution=1.0):
+    """Runs Leiden on a NetworkX graph and returns the igraph partition + node list."""
+    nx_nodes = list(graph.nodes())
     node_index = {n: i for i, n in enumerate(nx_nodes)}
 
-    ig_edges  = [(node_index[u], node_index[v]) for u, v in graph.edges()]
+    ig_edges = [(node_index[u], node_index[v]) for u, v in graph.edges()]
     ig_weights = [graph[u][v].get('weight', 1.0) for u, v in graph.edges()]
 
     ig_graph = ig.Graph(n=len(nx_nodes), edges=ig_edges)
     ig_graph.es['weight'] = ig_weights
 
-    # --- 2. Run Leiden with RBConfigurationVertexPartition (supports weights) ---
     partition = leidenalg.find_partition(
         ig_graph,
         leidenalg.RBConfigurationVertexPartition,
         weights='weight',
         resolution_parameter=resolution,
-        n_iterations=-1,   # run until convergence
-        seed=42,           # reproducible results
+        n_iterations=-1,
+        seed=42,
     )
+    return partition, nx_nodes
 
-    # --- 3. Build community dicts ---
-    # Pre-build a lookup: igraph node id → NetworkX node data
-    nx_data = [graph.nodes[nx_nodes[i]] for i in range(len(nx_nodes))]
 
+def _build_community_dicts(partition, nx_nodes, artist_proj, full_graph):
+    """
+    Converts a Leiden partition into community dicts enriched with entity
+    information from the full heterogeneous graph.
+    """
     communities = []
     for cid, member_ids in enumerate(partition):
-        artists, tokens = [], set()
-
+        artists = []
         for mid in member_ids:
-            node_data = nx_data[mid]
-            name      = node_data.get('name', '')
-            ntype     = node_data.get('type', '')
-
-            # Collect artist names for cross-referencing with artist_relationships
-            if ntype == 'Artist' and name:
+            node = nx_nodes[mid]
+            data = artist_proj.nodes[node]
+            name = data.get('name', '')
+            if name:
                 artists.append(name)
 
-            # Pool all entity names as tokens for retrieval matching
-            if name:
-                # Tokenise: lowercase, split on spaces/punctuation
+        if not artists:
+            continue
+
+        # Gather entities from the full graph for this community's artists
+        entity_buckets = defaultdict(Counter)
+        for artist_name in artists:
+            artist_node = (artist_name, 'Artist')
+            if artist_node not in full_graph:
+                continue
+            for neighbor in full_graph.neighbors(artist_node):
+                ndata = full_graph.nodes[neighbor]
+                ntype = ndata.get('type', '')
+                nname = ndata.get('name', '')
+                if ntype and nname and ntype != 'Artist':
+                    entity_buckets[ntype][nname] += 1
+
+        # Build token bag for retrieval matching
+        tokens = set()
+        for artist_name in artists:
+            for tok in re.sub(r'[^\w\s]', '', artist_name.lower()).split():
+                if len(tok) > 2:
+                    tokens.add(tok)
+        for counter in entity_buckets.values():
+            for name in counter:
                 for tok in re.sub(r'[^\w\s]', '', name.lower()).split():
                     if len(tok) > 2:
                         tokens.add(tok)
 
-        if not artists:
-            continue  # skip communities with no artists (pure geo/instrument hubs)
+        # Build a summary showing the defining traits of this community
+        summary_lines = [f"Community {cid} ({len(artists)} artists):"]
+        summary_lines.append(f"  Artists: {', '.join(sorted(artists))}")
 
-        # Build a concise readable summary for the LLM prompt
-        type_buckets: dict[str, list[str]] = defaultdict(list)
-        for mid in member_ids:
-            nd = nx_data[mid]
-            if nd.get('name'):
-                type_buckets[nd.get('type', 'Unknown')].append(nd['name'])
-
-        summary_lines = [f"Community {cid}:"]
-        type_order = ['Artist', 'Theme', 'Category', 'Instrument',
+        type_order = ['Category', 'Instrument', 'Theme', 'Keyword',
                       'Location', 'Municipality', 'District', 'Region']
         for t in type_order:
-            names = sorted(set(type_buckets.get(t, [])))
-            if names:
-                summary_lines.append(f"  {t}(s): {', '.join(names)}")
+            if t in entity_buckets:
+                top_names = [n for n, _ in entity_buckets[t].most_common(8)]
+                if top_names:
+                    summary_lines.append(f"  {t}(s): {', '.join(top_names)}")
 
         communities.append({
-            'id':      cid,
-            'artists': artists,
-            'tokens':  tokens,
-            'summary': '\n'.join(summary_lines),
+            'id':             cid,
+            'artists':        artists,
+            'tokens':         tokens,
+            'entity_profile': dict(entity_buckets),
+            'summary':        '\n'.join(summary_lines),
         })
 
     return communities
+
+
+def build_leiden_communities(artist_proj, full_graph, resolution=1.0):
+    """
+    Runs Leiden on the artist projection graph and returns community dicts
+    enriched with entity information from the full knowledge graph.
+
+    Each community dict contains:
+        id, artists, tokens, entity_profile, summary
+    """
+    if artist_proj.number_of_edges() == 0:
+        return []
+
+    partition, nx_nodes = _run_leiden(artist_proj, resolution)
+    return _build_community_dicts(partition, nx_nodes, artist_proj, full_graph)
+
+
+def build_hierarchical_communities(artist_proj, full_graph,
+                                   resolutions=None):
+    """
+    Runs Leiden at multiple resolutions to produce a hierarchy of communities.
+    Returns: dict[float, list[dict]]  — resolution → community list
+
+    Coarse (low res)  → broad clusters (e.g. regional traditions)
+    Fine   (high res) → tight clusters (e.g. specific instrument groups)
+    """
+    if resolutions is None:
+        resolutions = [0.3, 0.8, 1.5]
+
+    if artist_proj.number_of_edges() == 0:
+        return {r: [] for r in resolutions}
+
+    hierarchy = {}
+    for res in resolutions:
+        partition, nx_nodes = _run_leiden(artist_proj, res)
+        hierarchy[res] = _build_community_dicts(
+            partition, nx_nodes, artist_proj, full_graph
+        )
+    return hierarchy
 
 
 def visualize_graph(graph, title="Knowledge Graph"):
@@ -327,6 +430,10 @@ def fetch_data_from_db(db_path='lastro.db'):
             'Concelho':      dict(r).get('municipality'),
             'Distrito/Ilha': dict(r).get('district'),
             'Região':        dict(r).get('region'),
+            'keywords':      dict(r).get('keywords'),
+            'history':       dict(r).get('history'),
+            'other_info':    dict(r).get('other_info'),
+            'biographies':   dict(r).get('biographies'),
         }
         for r in rows
     ]
@@ -361,14 +468,52 @@ def fetch_data_from_csv(csv_path=r'C://Users//joanm//Downloads//Base dados - VIM
 
 
 if __name__ == '__main__':
-    data_rows = fetch_data_from_csv()
-    full_graph = create_knowledge_graph_from_data(data_rows)
+    data_rows = fetch_data_from_db()
+    if not data_rows:
+        print("No data found in database. Exiting.")
+        sys.exit(1)
 
+    full_graph = create_knowledge_graph_from_data(data_rows)
     artist_relationships, name_to_artists = build_relationships_dict(full_graph)
 
-    # Quick inspection
-    sample_artist = next(iter(artist_relationships))
-    print(f"\nSample entry — '{sample_artist}':")
-    for k, v in artist_relationships[sample_artist].items():
-        if v:
-            print(f"  {k}: {v}")
+    artist_proj = build_artist_projection(full_graph)
+    hierarchy = build_hierarchical_communities(artist_proj, full_graph)
+
+    print(f"Full graph: {full_graph.number_of_nodes()} nodes, {full_graph.number_of_edges()} edges")
+    print(f"Artist projection: {artist_proj.number_of_nodes()} nodes, {artist_proj.number_of_edges()} edges")
+    for res, comms in sorted(hierarchy.items()):
+        print(f"  Resolution {res}: {len(comms)} communities")
+
+    if len(sys.argv) > 1:
+        search_term = sys.argv[1]
+        print(f"\nSearching for artists related to '{search_term}'...")
+
+        matched_artists = {
+            artist for name, artists in name_to_artists.items()
+            if search_term.lower() in name.lower()
+            for artist in artists
+        }
+
+        if matched_artists:
+            for artist_name in sorted(matched_artists):
+                print(f"\n--- Entry for '{artist_name}' ---")
+                entry = artist_relationships.get(artist_name)
+                if entry:
+                    for k, v in entry.items():
+                        if v:
+                            print(f"  {k}: {v}")
+                else:
+                    print(f"  No detailed entry found for '{artist_name}'.")
+        else:
+            print(f"No artists found matching '{search_term}'.")
+
+    else:
+        print("\nNo search term provided. Showing a sample artist entry.")
+        if artist_relationships:
+            sample_artist = next(iter(artist_relationships))
+            print(f"\n--- Sample entry — '{sample_artist}' ---")
+            for k, v in artist_relationships[sample_artist].items():
+                if v:
+                    print(f"  {k}: {v}")
+        else:
+            print("No artist relationships were built.")
