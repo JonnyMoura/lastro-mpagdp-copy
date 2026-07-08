@@ -15,12 +15,16 @@ from database.setup import initDatabase, cleanInteractions
 from database.fetchData import fetchCSV
 from database.models import Project, Interaction
 
+from ai.rag.setup import initRag
+from ai.rag.ragQuery import answerExplorationQuestion
+
 from utilities.scheduler.setup import initScheduler, cleanScheduler
 from utilities.cors.setup import initCors
 from utilities.ratelimit.setup import initRateLimiter, limiter
 
 app = Flask(__name__)
 initDatabase(app)
+initRag(app)
 initCors(app)
 initRateLimiter(app)
 initScheduler(app)
@@ -55,6 +59,12 @@ def get_suggestions(project_id):
 @limiter.limit("20 per minute")
 def handle_query():
     return jsonify(handleQuery(request.json))
+
+@app.route('/explore-answer', methods=['POST'])
+@limiter.limit("20 per minute")
+def explore_answer():
+    question = request.json.get("question", "")
+    return jsonify({"answer": answerExplorationQuestion(question)})
 
 @app.route('/fetch-csv')
 @limiter.limit("20 per minute")

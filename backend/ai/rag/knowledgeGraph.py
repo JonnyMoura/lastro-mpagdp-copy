@@ -1,13 +1,14 @@
-import csv
+'''
+/ai/rag/knowledgeGraph.py
+-> builds the artist knowledge graph and Leiden community hierarchy from project rows
+'''
+
 import re
 import networkx as nx
-import matplotlib.pyplot as plt
 from collections import Counter, defaultdict
 import math
-import sqlite3
 import igraph as ig
 import leidenalg
-import sys
 
 
 def create_knowledge_graph_from_data(data_rows):
@@ -161,7 +162,7 @@ def build_relationships_dict(graph):
 
         artist_name = data.get('name', '')
         entry = {key: [] for key in TYPE_KEY.values()}
-        
+
         # Add node attributes to the entry
         if 'history' in data:
             entry['history'] = data['history']
@@ -359,8 +360,7 @@ def build_leiden_communities(artist_proj, full_graph, resolution=1.0):
     return _build_community_dicts(partition, nx_nodes, artist_proj, full_graph)
 
 
-def build_hierarchical_communities(artist_proj, full_graph,
-                                   resolutions=None):
+def build_hierarchical_communities(artist_proj, full_graph, resolutions=None):
     """
     Runs Leiden at multiple resolutions to produce a hierarchy of communities.
     Returns: dict[float, list[dict]]  — resolution → community list
@@ -381,139 +381,3 @@ def build_hierarchical_communities(artist_proj, full_graph,
             partition, nx_nodes, artist_proj, full_graph
         )
     return hierarchy
-
-
-def visualize_graph(graph, title="Knowledge Graph"):
-    """
-    Creates and displays a visualization of the graph with tuple-based nodes.
-    """
-    if not graph or graph.number_of_nodes() == 0:
-        print("Graph is empty or invalid. Cannot visualize.")
-        return
-
-    plt.figure(figsize=(40, 40))
-    pos = nx.kamada_kawai_layout(graph)
-
-    labels = {node: str(node) for node in graph.nodes()}
-    node_colors = []
-    color_map = {
-        'Artist': 'lightblue', 'Theme': 'lightgreen', 'Instrument': 'lightcoral',
-        'Category': 'gold', 'Municipality': 'plum', 'District': 'slateblue',
-        'Region': 'darkcyan', 'Location': 'lightgrey'
-    }
-    for _, data in graph.nodes(data=True):
-        node_colors.append(color_map.get(data.get('type'), 'grey'))
-
-    nx.draw(graph, pos, labels=labels, with_labels=True, node_color=node_colors,
-            node_size=3000, font_size=10, width=1.5, edge_color='gray')
-    edge_labels = nx.get_edge_attributes(graph, 'relationship')
-    nx.draw_networkx_edge_labels(graph, pos, edge_labels=edge_labels, font_color='red')
-    plt.title(title, fontsize=30)
-    plt.show()
-
-
-def fetch_data_from_db(db_path='lastro.db'):
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM projects")
-    rows = cursor.fetchall()
-    conn.close()
-
-    return [
-        {
-            'Nome':          dict(r).get('author'),
-            'Tema':          dict(r).get('title'),
-            'Instrumentos':  dict(r).get('instruments'),
-            'Categoria':     dict(r).get('category'),
-            'Local':         dict(r).get('location'),
-            'Concelho':      dict(r).get('municipality'),
-            'Distrito/Ilha': dict(r).get('district'),
-            'Região':        dict(r).get('region'),
-            'keywords':      dict(r).get('keywords'),
-            'history':       dict(r).get('history'),
-            'other_info':    dict(r).get('other_info'),
-            'biographies':   dict(r).get('biographies'),
-        }
-        for r in rows
-    ]
-
-
-def fetch_data_from_csv(csv_path=r'C://Users//joanm//Downloads//Base dados - VIMEO.csv'):
-    data_rows = []
-    encodings = ['utf-8', 'latin-1']
-    for enc in encodings:
-        try:
-            with open(csv_path, 'r', encoding=enc) as infile:
-                reader = csv.DictReader(infile)
-                for row in reader:
-                    data_rows.append({
-                        'Nome':          row.get('Nome', '').strip(),
-                        'Tema':          row.get('Tema', '').strip(),
-                        'Instrumentos':  row.get('Instrumentos', '').strip(),
-                        'Categoria':     row.get('Categoria', '').strip(),
-                        'Local':         row.get('Local', '').strip(),
-                        'Concelho':      row.get('Concelho', '').strip(),
-                        'Distrito/Ilha': row.get('Distrito/Ilha', '').strip(),
-                        'Região':        row.get('Região', '').strip(),
-                    })
-            print(f"Loaded {len(data_rows)} rows from CSV ({enc}).")
-            return data_rows
-        except FileNotFoundError:
-            print(f"Error: CSV file not found at {csv_path}")
-            return []
-        except UnicodeDecodeError:
-            continue
-    return data_rows
-
-
-if __name__ == '__main__':
-    data_rows = fetch_data_from_db()
-    if not data_rows:
-        print("No data found in database. Exiting.")
-        sys.exit(1)
-
-    full_graph = create_knowledge_graph_from_data(data_rows)
-    artist_relationships, name_to_artists = build_relationships_dict(full_graph)
-
-    artist_proj = build_artist_projection(full_graph)
-    hierarchy = build_hierarchical_communities(artist_proj, full_graph)
-
-    print(f"Full graph: {full_graph.number_of_nodes()} nodes, {full_graph.number_of_edges()} edges")
-    print(f"Artist projection: {artist_proj.number_of_nodes()} nodes, {artist_proj.number_of_edges()} edges")
-    for res, comms in sorted(hierarchy.items()):
-        print(f"  Resolution {res}: {len(comms)} communities")
-
-    if len(sys.argv) > 1:
-        search_term = sys.argv[1]
-        print(f"\nSearching for artists related to '{search_term}'...")
-
-        matched_artists = {
-            artist for name, artists in name_to_artists.items()
-            if search_term.lower() in name.lower()
-            for artist in artists
-        }
-
-        if matched_artists:
-            for artist_name in sorted(matched_artists):
-                print(f"\n--- Entry for '{artist_name}' ---")
-                entry = artist_relationships.get(artist_name)
-                if entry:
-                    for k, v in entry.items():
-                        if v:
-                            print(f"  {k}: {v}")
-                else:
-                    print(f"  No detailed entry found for '{artist_name}'.")
-        else:
-            print(f"No artists found matching '{search_term}'.")
-
-    else:
-        print("\nNo search term provided. Showing a sample artist entry.")
-        if artist_relationships:
-            sample_artist = next(iter(artist_relationships))
-            print(f"\n--- Sample entry — '{sample_artist}' ---")
-            for k, v in artist_relationships[sample_artist].items():
-                if v:
-                    print(f"  {k}: {v}")
-        else:
-            print("No artist relationships were built.")

@@ -6,6 +6,7 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 
 from database.fetchData import fetchCSV
+from ai.rag.setup import rebuildRag
 
 # ==================================================
 # global vars
@@ -25,14 +26,18 @@ def jobToAppContext(app,jobFunction):
         except Exception as e:
             print(f"Error in scheduled CSV fetch: {e}")
 
+def fetchCSVAndRebuildRag(app):
+    fetchCSV()
+    rebuildRag(app)
+
 # ==================================================
 # init and clean methods
 # ==================================================
 
 def initScheduler(app):
-    # fetch data from CSV job
+    # fetch data from CSV, then rebuild the RAG knowledge graph from the refreshed data
     scheduler.add_job(
-        func=lambda: jobToAppContext(app, fetchCSV),
+        func=lambda: jobToAppContext(app, lambda: fetchCSVAndRebuildRag(app)),
         trigger='cron',
         hour=4, minute=0,
         timezone='Europe/Lisbon',
