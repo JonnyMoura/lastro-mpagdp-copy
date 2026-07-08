@@ -7,10 +7,7 @@ import os
 import requests
 from dotenv import load_dotenv
 
-from ai.rag.retrieval import (
-    retrieve_exploration_context,
-    retrieve_enhanced_context,
-)
+from ai.rag.retrieval import retrieve_exploration_context
 
 load_dotenv()
 OLLAMA_URL = os.getenv("OLLAMA_URL")
@@ -18,16 +15,15 @@ OLLAMA_URL = os.getenv("OLLAMA_URL")
 
 def answer_question_with_exploration(
     question, artist_relationships, name_to_artists,
-    artist_proj, community_hierarchy, text_token_index, artist_texts,
+    community_hierarchy, text_token_index, artist_texts,
 ):
     ctx = retrieve_exploration_context(
         question, artist_relationships, name_to_artists,
-        artist_proj, community_hierarchy, text_token_index, artist_texts,
+        community_hierarchy, text_token_index, artist_texts,
     )
 
     direct_context = '\n\n'.join(ctx['direct']) if ctx['direct'] else ''
     discovery_context = '\n\n'.join(ctx['discoveries']) if ctx['discoveries'] else ''
-    related_context = '\n\n'.join(ctx['related']) if ctx['related'] else ''
     community_context = ctx.get('community_summary', '') or ''
 
     if not direct_context and not discovery_context:
@@ -65,9 +61,6 @@ Extrai e desenvolve TODAS estas referencias culturais que encontrares no context
 ## 3. Continuar a Explorar
 Sugere 3-4 perguntas de seguimento em portugues que o utilizador possa fazer para continuar a navegar o arquivo. Baseia-as tanto na resposta direta como nas descobertas culturais. Torna-as especificas e intrigantes — pelo menos metade deve ser sobre temas culturais presentes no contexto (religiao, festas, gastronomia, artesanato, vida rural, poesia, cultura cigana, medicina popular, etc.).
 
-## 4. Obras Relacionadas
-Usando o 'Contexto Relacionado', menciona brevemente outros artistas ou projetos ligados a este tema que o utilizador possa querer descobrir.
-
 **Regras:**
 - Se uma seccao nao tiver contexto, omite-a completamente.
 - Escreve em portugues.
@@ -85,9 +78,6 @@ Usando o 'Contexto Relacionado', menciona brevemente outros artistas ou projetos
 
 **Contexto de Comunidade:**
 {community_context}
-
-**Contexto Relacionado:**
-{related_context}
 ---
 
 **Pergunta:** {question}
@@ -106,68 +96,21 @@ Usando o 'Contexto Relacionado', menciona brevemente outros artistas ou projetos
                 'prompt': prompt,
                 'stream': False,
                 'keep_alive': -1,
+                # This prompt stuffs several artists' full bios/history into
+                # context (often 4000+ tokens) on top of the instructions.
+                # Without an explicit num_ctx, Ollama's default context
+                # window truncates the prompt and silently drops the
+                # instructions (they're at the top), leaving the model to
+                # answer from whatever fragment of context survived.
+                'options': {
+                    'num_ctx': 8192,
+                },
             },
-            timeout=120,
-        )
-        if response.status_code == 200:
-            return response.json().get('response', 'No response content found.')
-        return f"Error from Ollama API: {response.status_code} - {response.text}"
-    except requests.exceptions.RequestException as e:
-        return f"Error connecting to Ollama: {e}"
-    except Exception as e:
-        return f"An unexpected error occurred: {e}"
-
-
-def answer_question_with_rag(question, artist_relationships, name_to_artists,
-                             artist_proj, community_hierarchy=None):
-    direct_context_blocks, related_context_blocks = retrieve_enhanced_context(
-        question, artist_relationships, name_to_artists, artist_proj, community_hierarchy
-    )
-
-    if not direct_context_blocks:
-        return "I couldn't find any relevant information in the graph to answer that question."
-
-    direct_context = '\n\n'.join(direct_context_blocks)
-    related_context = '\n\n'.join(related_context_blocks)
-
-    prompt = f"""You are an expert assistant on Portuguese folk music. Your task is to answer the user's question based *only* on the context provided.
-
-Your answer MUST be structured in two parts:
-1. A direct answer to the question.
-2. A section called "Related Discoveries" that highlights other artists or projects that are connected to the answer, sparking curiosity.
-
-**Strict Rules:**
-- Use ONLY the information from the 'Direct Answer Context' to formulate the direct answer.
-- Use ONLY the information from the 'Related Discoveries Context' for the "Related Discoveries" section.
-- If the "Related Discoveries Context" is empty, DO NOT include the "Related Discoveries" section.
-- Write in a clear, engaging, and informative style.
-
----
-**Direct Answer Context:**
-{direct_context}
-
-**Related Discoveries Context:**
-{related_context}
----
-
-**Question:** {question}
-
-**Answer:**
-"""
-
-    if not OLLAMA_URL:
-        return "Error: OLLAMA_URL is not set in the environment."
-
-    try:
-        response = requests.post(
-            OLLAMA_URL,
-            json={
-                'model': 'llama3.1:8b',
-                'prompt': prompt,
-                'stream': False,
-                'keep_alive': -1,
-            },
-            timeout=60,
+            # This model is only ~68% GPU-offloaded on this machine (~7-8
+            # tok/s), and the prompt asks for a long multi-section answer on
+            # top of a multi-thousand-token retrieved context, so generation
+            # alone can take several minutes worst case.
+            timeout=480,
         )
         if response.status_code == 200:
             return response.json().get('response', 'No response content found.')
@@ -190,7 +133,6 @@ def answerExplorationQuestion(question):
         question,
         state.artist_relationships,
         state.name_to_artists,
-        state.artist_proj,
         state.community_hierarchy,
         state.text_token_index,
         state.artist_texts,

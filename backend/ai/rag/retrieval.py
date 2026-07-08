@@ -39,6 +39,14 @@ def _tokenize(text):
     return {t for t in cleaned.split() if t not in ALL_STOP_WORDS and len(t) > 2}
 
 
+def _contains_name(text_lower, name_lower):
+    """
+    Whole-word/phrase match: a plain substring check would let a short name. Word boundaries prevent that while still matching multi-word
+    names normally.
+    """
+    return re.search(r'\b' + re.escape(name_lower) + r'\b', text_lower) is not None
+
+
 def _format_artist_context(artist_name, entry):
     """Renders one artist's relationship dict as a readable string for the LLM prompt."""
     lines = [f"Artist: {artist_name}"]
@@ -361,13 +369,11 @@ def retrieve_exploration_context(
     question,
     artist_relationships,
     name_to_artists,
-    artist_proj,
     community_hierarchy,
     text_token_index,
     artist_texts,
     max_direct=5,
     max_discoveries=8,
-    max_related=5,
 ):
     """
     Multi-stage exploration retrieval:
@@ -385,7 +391,7 @@ def retrieve_exploration_context(
        content passed to the LLM to find cross-domain connections
     C) Text search results as fallback
 
-    Returns dict with keys: direct, discoveries, related, community_summary
+    Returns dict with keys: direct, discoveries, community_summary
     """
     question_lower = question.lower()
     question_tokens = _tokenize(question)
@@ -397,7 +403,7 @@ def retrieve_exploration_context(
     # --- Stage 1: Artist name match ---
     sorted_artist_names = sorted(artist_names_lower.keys(), key=len, reverse=True)
     for name_lower in sorted_artist_names:
-        if name_lower in question_lower:
+        if _contains_name(question_lower, name_lower):
             direct_artists.append(artist_names_lower[name_lower])
             break
 
@@ -408,7 +414,7 @@ def retrieve_exploration_context(
         for name_lower in sorted_entity_names:
             if not _is_specific_entity(name_lower):
                 continue
-            if name_lower in question_lower and name_lower not in artist_names_lower:
+            if _contains_name(question_lower, name_lower) and name_lower not in artist_names_lower:
                 for a in sorted(name_to_artists[name_lower]):
                     if a not in seen and a in artist_relationships:
                         entity_artists.append(a)
@@ -593,73 +599,11 @@ def retrieve_exploration_context(
                 lines.append(f"    {label}: {snippet.strip()[:600]}")
         discovery_blocks.append('\n'.join(lines))
 
-    # --- Build related context ---
-    related_names = []
-    if primary_artists:
-        related_names = find_related_artists(
-            artist_proj, primary_artists[0], top_k=max_related
-        )
-    related_blocks = [
-        _format_artist_context(a, artist_relationships[a])
-        for a in related_names
-        if a in artist_relationships and a not in set(primary_artists)
-    ]
-
     return {
         'direct': direct_blocks,
         'discoveries': discovery_blocks,
-        'related': related_blocks,
         'community_summary': community_summary,
     }
-
-
-def retrieve_enhanced_context(
-    question,
-    artist_relationships,
-    name_to_artists,
-    artist_proj,
-    community_hierarchy=None,
-    max_related=5,
-):
-    """
-    Stage 1 -- find the directly named artist.
-    Stage 2 -- find related artists via projection graph neighbors.
-
-    Returns: (direct_context_blocks, related_context_blocks)
-    """
-    question_lower = question.lower()
-
-    # --- Stage 1: Find the "Direct Hit" ---
-    direct_hit_artist = None
-    sorted_names = sorted(name_to_artists.keys(), key=len, reverse=True)
-
-    for name_lower in sorted_names:
-        if name_lower in question_lower:
-            artists = name_to_artists[name_lower]
-            if artists:
-                direct_hit_artist = sorted(list(artists))[0]
-                break
-
-    if not direct_hit_artist:
-        fallback_context = retrieve_relevant_context(
-            question, artist_relationships, name_to_artists, community_hierarchy
-        )
-        return (fallback_context, [])
-
-    direct_context = [
-        _format_artist_context(direct_hit_artist, artist_relationships[direct_hit_artist])
-    ]
-
-    # --- Stage 2: Related discoveries via projection graph ---
-    related_names = find_related_artists(artist_proj, direct_hit_artist, top_k=max_related)
-
-    related_context = [
-        _format_artist_context(a, artist_relationships[a])
-        for a in related_names
-        if a in artist_relationships
-    ]
-
-    return direct_context, related_context
 
 
 def _score_communities(question_tokens, communities):
@@ -680,76 +624,6 @@ def _score_communities(question_tokens, communities):
 
     hits.sort(key=lambda x: x[0], reverse=True)
     return hits
-
-
-def retrieve_relevant_context(
-    question,
-    artist_relationships,
-    name_to_artists,
-    community_hierarchy=None,
-    max_artists=10,
-):
-    """
-    Stage 1 -- direct substring match on any known name.
-    Stage 2 -- hierarchical Leiden community match.
-    Stage 3 -- keyword overlap fallback.
-    """
-    question_lower = question.lower()
-    question_tokens = _tokenize(question)
-    matched_artists = set()
-
-    for name_lower, artists in name_to_artists.items():
-        if name_lower in question_lower:
-            matched_artists.update(artists)
-
-    if matched_artists:
-        return [
-            _format_artist_context(a, artist_relationships[a])
-            for a in sorted(matched_artists)[:max_artists]
-            if a in artist_relationships
-        ]
-
-    if community_hierarchy:
-        for resolution in sorted(community_hierarchy.keys(), reverse=True):
-            communities = community_hierarchy[resolution]
-            hits = _score_communities(question_tokens, communities)
-            if not hits:
-                continue
-            seen_artists = set()
-            context_blocks = []
-            for _, community in hits:
-                context_blocks.append(community['summary'])
-                for artist_name in community['artists']:
-                    if artist_name not in seen_artists and artist_name in artist_relationships:
-                        context_blocks.append(
-                            _format_artist_context(artist_name, artist_relationships[artist_name])
-                        )
-                        seen_artists.add(artist_name)
-                        if len(seen_artists) >= max_artists:
-                            break
-                if len(seen_artists) >= max_artists:
-                    break
-            if context_blocks:
-                return context_blocks
-
-    scored = []
-    for artist_name, entry in artist_relationships.items():
-        bag_parts = [artist_name]
-        for v in entry.values():
-            if isinstance(v, list):
-                bag_parts.extend(v)
-            elif isinstance(v, str):
-                bag_parts.append(v)
-        all_text = ' '.join(bag_parts)
-        overlap = question_tokens & _tokenize(all_text)
-        if len(overlap) >= 2:
-            scored.append((len(overlap), artist_name))
-
-    scored.sort(reverse=True)
-    return [
-        _format_artist_context(a, artist_relationships[a])
-        for _, a in scored[:max_artists]
-    ]
 
 
 def print_artist_entry(artist_name, artist_relationships):
