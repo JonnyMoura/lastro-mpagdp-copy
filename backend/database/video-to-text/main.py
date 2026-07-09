@@ -1,3 +1,4 @@
+import json
 import os
 import time
 import pandas as pd
@@ -6,6 +7,7 @@ import concurrent.futures
 from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
+from pydantic import BaseModel, Field
 
 # 1. Load API key from .env file
 load_dotenv()
@@ -26,7 +28,7 @@ output_csv = "results.csv"
 excel_file = 'Base_dados.xlsx'
 
 try:
-    df_espanha = pd.read_excel(excel_file, sheet_name='ESPANHA')
+    df_espanha = pd.read_excel(excel_file, sheet_name='ESPANHA',engine='openpyxl')
     espanha_links = set(df_espanha['Link'].dropna().unique())
 except Exception as e:
     print(f"Could not pre-load ESPANHA sheet for duplication check: {e}")
@@ -116,6 +118,9 @@ Do NOT use the artist name or track title provided in this prompt to hallucinate
 If there is absolutely no text written directly on the video frame, you MUST explicitly write: 'No text on screen'.
 """
 
+class VideoAnalysis(BaseModel):
+    audio_transcription: str = Field(description="Complete audio transcription or 'Instrumental - no lyrics spoken or sung.'")
+    visual_description: str = Field(description="Detailed visual description in pt-PT.")
 
 def process_single_video(index, link_vimeo, artist, title, sheet_context, concelho, distrito):
     prefix = f"[{sheet_context} | Row {index + 1} | {artist}]"
@@ -150,7 +155,6 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
         if gemini_video.state.name == "FAILED":
             return f"{prefix} Error: Cloud processing failed."
 
-        # Zmiana: Przekazywanie zmiennych lokalizacyjnych do formatowania promptów
         if sheet_context.upper() == 'ESPANHA':
             ai_prompt = prompt_spain.format(
                 artist=artist,
@@ -168,8 +172,21 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
 
         response = client.models.generate_content(
             model='gemini-3.1-flash-lite',
-            contents=[gemini_video, ai_prompt]
+            contents=[gemini_video, ai_prompt],
+            config={
+                'response_mime_type': 'application/json',
+                'response_schema': VideoAnalysis,
+            }
         )
+
+        try:
+            analysis_data = json.loads(response.text)
+            transcription = analysis_data.get("audio_transcription", "")
+            visual_desc = analysis_data.get("visual_description", "")
+        except Exception as json_err:
+            print(f"{prefix} JSON Parsing failed, saving raw text. Error: {json_err}")
+            transcription = response.text
+            visual_desc = "ERROR: Could not parse json"
 
         result_df = pd.DataFrame([{
             'Index': index + 1,
@@ -177,7 +194,8 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
             'Artist': artist,
             'Title': title,
             'Link': link_vimeo,
-            'AI_Analysis': response.text
+            'Audio transcription': transcription,
+            'Visual description': visual_desc
         }])
 
         result_df.to_csv(output_csv, mode='a', header=not os.path.exists(output_csv), index=False)
@@ -208,15 +226,15 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
 
 # --- MULTITHREADING EXECUTOR ---
 MAX_CONCURRENT_THREADS = 3
-# sheets_to_process = ['ESPANHA', 'VIMEO']
-sheets_to_process = ['VIMEO']
+sheets_to_process = ['ESPANHA', 'VIMEO']
+#sheets_to_process = ['VIMEO']
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) as executor:
     futures = []
     for sheet in sheets_to_process:
         try:
             print(f"Loading sheet: {sheet}")
-            df = pd.read_excel(excel_file, sheet_name=sheet)
+            df = pd.read_excel(excel_file, sheet_name=sheet,engine='openpyxl')
             df_clean = df.dropna(subset=['Link'])
 
             if sheet.upper() == 'VIMEO' and espanha_links:

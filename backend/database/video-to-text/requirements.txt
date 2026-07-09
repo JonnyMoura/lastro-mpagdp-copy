@@ -3,5 +3,6 @@ yt-dlp
 google-genai
 google
 openpyxl
-dotenv~=0.9.9
+dotenv
 python-dotenv~=1.2.2
+pydantic~=2.13.4
