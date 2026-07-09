@@ -46,6 +46,8 @@ def loadProjectRows():
 
     return [
         {
+            'id':            project.id,
+            'link':          project.link,
             'Nome':          project.author,
             'Tema':          project.title,
             'Instrumentos':  project.instruments,

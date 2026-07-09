@@ -12,3 +12,4 @@ networkx
 matplotlib
 python-igraph
 leidenalg
+scipy
