@@ -133,7 +133,16 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
         'format': 'best[height<=480][ext=mp4]/best[ext=mp4]/best',
         'outtmpl': local_path,
         'quiet': True,
-        'no_warnings': True
+        'no_warnings': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+        },
+        'socket_timeout': 40,
+        'retries': 10,
+        'fragment_retries': 10,
+        'file_access_retries': 5
     }
 
     try:
@@ -225,12 +234,24 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
 
 
 # --- MULTITHREADING EXECUTOR ---
-MAX_CONCURRENT_THREADS = 3
+MAX_CONCURRENT_THREADS = 1
 sheets_to_process = ['ESPANHA', 'VIMEO']
 #sheets_to_process = ['VIMEO']
 
+processed_links = set()
+if os.path.exists(output_csv):
+    try:
+        column_names = ['Index', 'Sheet', 'Artist', 'Title', 'Link', 'Audio transcription', 'Visual description']
+        df_results = pd.read_csv(output_csv, header=None, names=column_names,encoding='cp1252', encoding_errors='ignore')
+        if 'Link' in df_results.columns:
+            processed_links = set(df_results['Link'].astype(str).str.strip().unique())
+            print(f" Found {len(processed_links)} already processed videos in '{output_csv}'. They will be skipped.")
+    except Exception as e:
+        print(f"Could not read existing results.csv: {e}")
+
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) as executor:
     futures = []
+    currently_submitted_in_batch = 0
     for sheet in sheets_to_process:
         try:
             print(f"Loading sheet: {sheet}")
@@ -239,7 +260,6 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) a
 
             if sheet.upper() == 'VIMEO' and espanha_links:
                 initial_count = len(df_clean)
-                # Zostawiamy tylko te wiersze, których link NIE znajduje się w zbiorze espanha_links
                 df_clean = df_clean[~df_clean['Link'].isin(espanha_links)]
                 excluded_count = initial_count - len(df_clean)
                 if excluded_count > 0:
@@ -248,16 +268,25 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) a
             # if sheet.upper() == 'ESPANHA':
             #     test_df = df_clean[df_clean['Link'] == 'https://vimeo.com/47957582']
             # else:
-            #     # Przykładowy filtr testowy dla VIMEO (lub usuń warunek, by leciał head / całość)
-            test_df = df_clean[df_clean['Link'] == 'https://vimeo.com/272458529']
+            #test_df = df_clean[df_clean['Link'] == 'https://vimeo.com/272458529']
 
 
-            for index, row in test_df.iterrows():
+            for index, row in df_clean.iterrows():
+                current_link = str(row['Link']).strip()
+
+                if not current_link or current_link == 'nan':
+                    continue
+
+                if current_link in processed_links:
+                    print(
+                        f"[{sheet} | Row {index + 1}] Already processed. Skipping...")
+                    continue
+
                 futures.append(
                     executor.submit(
                         process_single_video,
                         index,
-                        row['Link'],
+                        current_link,
                         row['Nome'],
                         row['Tema'],
                         sheet,
@@ -265,10 +294,22 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) a
                         row['Distrito/Ilha']
                     )
                 )
+                currently_submitted_in_batch += 1
+
+                if currently_submitted_in_batch == MAX_CONCURRENT_THREADS:
+                    print(
+                        f" Sent {MAX_CONCURRENT_THREADS} NEW videos to queue. Pausing for 45 seconds to protect TPM/RPM limits...")
+                    time.sleep(45)
+                    currently_submitted_in_batch = 0  # reset licznika paczki
         except Exception as e:
             print(f"Error loading sheet {sheet}: {e}")
 
+
+
     for future in concurrent.futures.as_completed(futures):
         result = future.result()
+        if "API LIMIT" in result:
+            print(" One of the threads hit strict API Limit. Cooling down execution for 30 seconds...")
+            time.sleep(30)
 
 print(f" Check '{output_csv}' for your data.")
