@@ -8,12 +8,13 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import errors
 from pydantic import BaseModel, Field
+import sqlite3
 
 # 1. Load API key from .env file
 load_dotenv()
 API_KEY = os.getenv("GEMINI_API_KEY")
 
-if not API_KEY or API_KEY.startswith("TUTAJ"):
+if not API_KEY:
     raise ValueError("ERROR: Missing or invalid API key! Check your .env file.")
 
 # Initialize the Google client
@@ -25,14 +26,7 @@ os.makedirs(folder_downloads, exist_ok=True)
 output_csv = "results.csv"
 
 # 3. Load database from Excel
-excel_file = 'Base_dados.xlsx'
-
-try:
-    df_espanha = pd.read_excel(excel_file, sheet_name='ESPANHA',engine='openpyxl')
-    espanha_links = set(df_espanha['Link'].dropna().unique())
-except Exception as e:
-    print(f"Could not pre-load ESPANHA sheet for duplication check: {e}")
-    espanha_links = set()
+db_file = r"C:\PRAKTYKI\lastro-mpagdp-copy\backend\database\lastro.db"
 
 prompt_spain = """
 Analyze this video featuring the artist {artist} and the track '{title}'. 
@@ -122,8 +116,8 @@ class VideoAnalysis(BaseModel):
     audio_transcription: str = Field(description="Complete audio transcription or 'Instrumental - no lyrics spoken or sung.'")
     visual_description: str = Field(description="Detailed visual description in pt-PT.")
 
-def process_single_video(index, link_vimeo, artist, title, sheet_context, concelho, distrito):
-    prefix = f"[{sheet_context} | Row {index + 1} | {artist}]"
+def process_single_video(index, link_vimeo, artist, title, region_context, concelho, distrito):
+    prefix = f"[Row {index + 1} | {artist}]"
     local_path = os.path.join(folder_downloads, f"video_{index}.mp4")
     gemini_video = None
 
@@ -134,6 +128,7 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
         'outtmpl': local_path,
         'quiet': True,
         'no_warnings': True,
+        'extractor_args': {'vimeo': {'player_client': ['web']}},
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -164,7 +159,9 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
         if gemini_video.state.name == "FAILED":
             return f"{prefix} Error: Cloud processing failed."
 
-        if sheet_context.upper() == 'ESPANHA':
+        region_str = str(region_context).strip()
+
+        if 'Espanha' in region_str:
             ai_prompt = prompt_spain.format(
                 artist=artist,
                 title=title,
@@ -199,7 +196,6 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
 
         result_df = pd.DataFrame([{
             'Index': index + 1,
-            'Sheet': sheet_context,
             'Artist': artist,
             'Title': title,
             'Link': link_vimeo,
@@ -233,83 +229,75 @@ def process_single_video(index, link_vimeo, artist, title, sheet_context, concel
                 pass
 
 
-# --- MULTITHREADING EXECUTOR ---
-MAX_CONCURRENT_THREADS = 1
-sheets_to_process = ['ESPANHA', 'VIMEO']
-#sheets_to_process = ['VIMEO']
-
-processed_links = set()
+processed_ids = set()
 if os.path.exists(output_csv):
     try:
-        column_names = ['Index', 'Sheet', 'Artist', 'Title', 'Link', 'Audio transcription', 'Visual description']
-        df_results = pd.read_csv(output_csv, header=None, names=column_names,encoding='cp1252', encoding_errors='ignore')
+        column_names = ['Index', 'Artist', 'Title', 'Link', 'Audio transcription', 'Visual description']
+        df_results = pd.read_csv(output_csv, header=None, names=column_names, encoding='cp1252', encoding_errors='ignore')
         if 'Link' in df_results.columns:
-            processed_links = set(df_results['Link'].astype(str).str.strip().unique())
-            print(f" Found {len(processed_links)} already processed videos in '{output_csv}'. They will be skipped.")
+            for l in df_results['Link'].dropna().astype(str):
+                digits = ''.join(filter(str.isdigit, l))
+                if digits:
+                    processed_ids.add(digits)
+            print(f" Found {len(processed_ids)} already processed video IDs in '{output_csv}'. They will be skipped.")
     except Exception as e:
         print(f"Could not read existing results.csv: {e}")
+
+conn = sqlite3.connect(db_file)
+try:
+    df_all = pd.read_sql_query("SELECT * FROM projects", conn)
+finally:
+    conn.close()
+
+df_clean = df_all.dropna(subset=['link'])
+print(f"Total rows to check in DB: {len(df_clean)}")
+
+# --- MULTITHREADING EXECUTOR ---
+MAX_CONCURRENT_THREADS = 3
+
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_THREADS) as executor:
     futures = []
     currently_submitted_in_batch = 0
-    for sheet in sheets_to_process:
-        try:
-            print(f"Loading sheet: {sheet}")
-            df = pd.read_excel(excel_file, sheet_name=sheet,engine='openpyxl')
-            df_clean = df.dropna(subset=['Link'])
+    for index, row in df_clean.iterrows():
+        current_link = str(row['link']).strip()
 
-            if sheet.upper() == 'VIMEO' and espanha_links:
-                initial_count = len(df_clean)
-                df_clean = df_clean[~df_clean['Link'].isin(espanha_links)]
-                excluded_count = initial_count - len(df_clean)
-                if excluded_count > 0:
-                    print(f" Skipped {excluded_count} links in VIMEO sheet because they already exist in ESPANHA.")
+        if not current_link or current_link == 'nan':
+            continue
 
-            # if sheet.upper() == 'ESPANHA':
-            #     test_df = df_clean[df_clean['Link'] == 'https://vimeo.com/47957582']
-            # else:
-            #test_df = df_clean[df_clean['Link'] == 'https://vimeo.com/272458529']
+        current_id = ''.join(filter(str.isdigit, current_link))
 
+        if current_id in processed_ids:
+            print(f"[Row {index + 1}] Already processed. Skipping...")
+            continue
 
-            for index, row in df_clean.iterrows():
-                current_link = str(row['Link']).strip()
+        futures.append(
+            executor.submit(
+                process_single_video,
+                index,
+                current_link,
+                row['author'],
+                row['title'],
+                row['region'],
+                row['municipality'],
+                row['district']  
+            )
+        )
+        currently_submitted_in_batch += 1
 
-                if not current_link or current_link == 'nan':
-                    continue
+        if currently_submitted_in_batch == MAX_CONCURRENT_THREADS:
+            print(
+                f" Sent {MAX_CONCURRENT_THREADS} NEW video to queue. Pausing for 45 seconds to protect TPM/RPM limits...")
+            time.sleep(45)
+            currently_submitted_in_batch = 0
 
-                if current_link in processed_links:
-                    print(
-                        f"[{sheet} | Row {index + 1}] Already processed. Skipping...")
-                    continue
-
-                futures.append(
-                    executor.submit(
-                        process_single_video,
-                        index,
-                        current_link,
-                        row['Nome'],
-                        row['Tema'],
-                        sheet,
-                        row['Concelho'],
-                        row['Distrito/Ilha']
-                    )
-                )
-                currently_submitted_in_batch += 1
-
-                if currently_submitted_in_batch == MAX_CONCURRENT_THREADS:
-                    print(
-                        f" Sent {MAX_CONCURRENT_THREADS} NEW videos to queue. Pausing for 45 seconds to protect TPM/RPM limits...")
-                    time.sleep(45)
-                    currently_submitted_in_batch = 0  # reset licznika paczki
-        except Exception as e:
-            print(f"Error loading sheet {sheet}: {e}")
-
-
-
-    for future in concurrent.futures.as_completed(futures):
-        result = future.result()
-        if "API LIMIT" in result:
-            print(" One of the threads hit strict API Limit. Cooling down execution for 30 seconds...")
-            time.sleep(30)
+    if futures:
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            if result and "API LIMIT" in result:
+                print(" One of the threads hit strict API Limit. Cooling down execution for 30 seconds...")
+                time.sleep(30)
+    else:
+        print(" All links from Database are already processed!")
 
 print(f" Check '{output_csv}' for your data.")
