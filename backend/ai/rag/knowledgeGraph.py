@@ -5,11 +5,41 @@
 
 import re
 import sys
+import unicodedata
 import networkx as nx
 from collections import Counter, defaultdict
 import math
 import igraph as ig
 import leidenalg
+
+
+def _canonical_entity_key(name):
+    """
+    Case/accent/whitespace-insensitive identity for free-text entity tags
+    (Instrument, Category, Keyword) entered inconsistently across ~8,400
+    rows -- e.g. 'Voz' vs 'voz' (1,623 vs 4,930 occurrences) or 'Acustico'
+    vs 'Acustico' [sic, i.e. missing the accent] vs 'Acústico' (6 vs 6,598)
+    are the same real-world entity but, keyed by raw string, become two
+    separate graph nodes. That fragmentation understates each variant's
+    true frequency in get_weight() and splits what should be one
+    shared-entity bridge into several weaker ones in build_artist_projection,
+    directly degrading Leiden community quality. NOT applied to Artist
+    identity -- two people sharing a name that differs only by case are
+    still two different people, unlike two spellings of one instrument.
+    """
+    normalized = unicodedata.normalize('NFD', name.strip().lower())
+    normalized = ''.join(c for c in normalized if unicodedata.category(c) != 'Mn')
+    return re.sub(r'\s+', ' ', normalized)
+
+
+# Entity types whose free-text values are canonicalized before becoming a
+# graph node (see _canonical_entity_key). Scoped to the three types an audit
+# actually confirmed have real case/accent duplication. Theme/Location/Date
+# are left untouched: no evidence of the same problem there, and
+# Location/District/Municipality identity is deliberately compound-keyed
+# (name, parent) for disambiguation that a blanket pass shouldn't touch
+# without separate evidence.
+CANONICALIZED_TYPES = {'Instrument', 'Category', 'Keyword'}
 
 
 def create_knowledge_graph_from_data(data_rows):
@@ -34,25 +64,46 @@ def create_knowledge_graph_from_data(data_rows):
     """
     G = nx.Graph()
 
-    # Count node frequencies for weighting
+    # Count node frequencies for weighting. For CANONICALIZED_TYPES, also
+    # track every raw-cased/accented variant seen per canonical key, so a
+    # display name (the most common original variant) can be picked below --
+    # merged nodes should still show natural-looking text, not a lowercased/
+    # accent-stripped key.
     node_counts = Counter()
+    display_variants = defaultdict(Counter)  # (type, canonical_key) -> Counter(raw_name)
+
+    def _count_entity(entity_type, raw_name):
+        canon = _canonical_entity_key(raw_name)
+        node_counts[(entity_type, canon)] += 1
+        display_variants[(entity_type, canon)][raw_name] += 1
+
     for row in data_rows:
-        if row.get('Tema'): node_counts[row.get('Tema')] += 1
+        if row.get('Tema'): node_counts[('Theme', row.get('Tema'))] += 1
         if row.get('Instrumentos'):
             for inst in row['Instrumentos'].split(','):
-                node_counts[inst.strip()] += 1
+                inst = inst.strip()
+                if inst: _count_entity('Instrument', inst)
         if row.get('Categoria'):
             for cat in row['Categoria'].split(','):
-                node_counts[cat.strip()] += 1
-        if row.get('Local'): node_counts[row.get('Local')] += 1
+                cat = cat.strip()
+                if cat: _count_entity('Category', cat)
+        if row.get('Local'): node_counts[('Location', row.get('Local'))] += 1
+        if row.get('Data'): node_counts[('Date', row.get('Data'))] += 1
         if row.get('keywords'):
             for keyword in row['keywords'].split(','):
-                node_counts[keyword.strip()] += 1
+                keyword = keyword.strip()
+                if keyword: _count_entity('Keyword', keyword)
+
+    display_names = {
+        key: counter.most_common(1)[0][0]
+        for key, counter in display_variants.items()
+    }
 
     total_rows = len(data_rows)
 
-    def get_weight(name):
-        return math.log(total_rows / (node_counts.get(name, 0) + 1)) + 1
+    def get_weight(entity_type, name):
+        key = (entity_type, _canonical_entity_key(name)) if entity_type in CANONICALIZED_TYPES else (entity_type, name)
+        return math.log(total_rows / (node_counts.get(key, 0) + 1)) + 1
 
     for row_index, row in enumerate(data_rows):
         artist_name = row.get('Nome')
@@ -73,6 +124,8 @@ def create_knowledge_graph_from_data(data_rows):
             history=row.get('history', ''),
             other_info=row.get('other_info', ''),
             biographies=row.get('biographies', ''),
+            audio_transcription=row.get('audio_transcription', ''),
+            visual_description=row.get('visual_description', ''),
         )
 
         # A theme is effectively unique per artist, so when present it takes
@@ -85,28 +138,37 @@ def create_knowledge_graph_from_data(data_rows):
         if theme_name:
             theme_node = (theme_name, 'Theme')
             if not G.has_node(theme_node): G.add_node(theme_node, type='Theme', name=theme_name)
-            G.add_edge(artist_node, theme_node, relationship='has_theme', weight=get_weight(theme_name))
+            G.add_edge(artist_node, theme_node, relationship='has_theme', weight=get_weight('Theme', theme_name))
             G.add_edge(theme_node, video_node, relationship='documents', weight=1.0)
         else:
             G.add_edge(artist_node, video_node, relationship='has_video', weight=1.0)
 
         if row.get('Instrumentos'):
-            for name in [i.strip() for i in row['Instrumentos'].split(',') if i.strip()]:
-                node = (name, 'Instrument')
-                if not G.has_node(node): G.add_node(node, type='Instrument', name=name)
-                G.add_edge(video_node, node, relationship='plays', weight=get_weight(name))
+            for raw_name in [i.strip() for i in row['Instrumentos'].split(',') if i.strip()]:
+                canon = _canonical_entity_key(raw_name)
+                node = (canon, 'Instrument')
+                if not G.has_node(node): G.add_node(node, type='Instrument', name=display_names[('Instrument', canon)])
+                G.add_edge(video_node, node, relationship='plays', weight=get_weight('Instrument', raw_name))
 
         if row.get('Categoria'):
-            for name in [c.strip() for c in row['Categoria'].split(',') if c.strip()]:
-                node = (name, 'Category')
-                if not G.has_node(node): G.add_node(node, type='Category', name=name)
-                G.add_edge(video_node, node, relationship='in_category', weight=get_weight(name))
+            for raw_name in [c.strip() for c in row['Categoria'].split(',') if c.strip()]:
+                canon = _canonical_entity_key(raw_name)
+                node = (canon, 'Category')
+                if not G.has_node(node): G.add_node(node, type='Category', name=display_names[('Category', canon)])
+                G.add_edge(video_node, node, relationship='in_category', weight=get_weight('Category', raw_name))
 
         if row.get('keywords'):
-            for name in [k.strip() for k in row['keywords'].split(',') if k.strip()]:
-                node = (name, 'Keyword')
-                if not G.has_node(node): G.add_node(node, type='Keyword', name=name)
-                G.add_edge(video_node, node, relationship='has_keyword', weight=get_weight(name))
+            for raw_name in [k.strip() for k in row['keywords'].split(',') if k.strip()]:
+                canon = _canonical_entity_key(raw_name)
+                node = (canon, 'Keyword')
+                if not G.has_node(node): G.add_node(node, type='Keyword', name=display_names[('Keyword', canon)])
+                G.add_edge(video_node, node, relationship='has_keyword', weight=get_weight('Keyword', raw_name))
+
+        if row.get('Data'):
+            data_name = row['Data']
+            data_node = (data_name, 'Date')
+            if not G.has_node(data_node): G.add_node(data_node, type='Date', name=data_name)
+            G.add_edge(video_node, data_node, relationship='recorded_on', weight=get_weight('Date', data_name))
 
         local_name    = row.get('Local')
         concelho_name = row.get('Concelho')
@@ -134,7 +196,7 @@ def create_knowledge_graph_from_data(data_rows):
             local_node = (local_name, concelho_name, 'Location')
             if not G.has_node(local_node):
                 G.add_node(local_node, type='Location', name=local_name)
-            G.add_edge(video_node, local_node, relationship='located_in', weight=get_weight(local_name))
+            G.add_edge(video_node, local_node, relationship='located_in', weight=get_weight('Location', local_name))
 
         if local_node and concelho_node:
             G.add_edge(local_node, concelho_node, relationship='part_of', weight=1.0)
@@ -269,6 +331,7 @@ def build_relationships_dict(graph):
         'District':     'districts',
         'Region':       'regions',
         'Keyword':      'keywords',
+        'Date':         'dates',
     }
 
     artist_relationships = {}   # artist_name  -> {type_key: [names]}
@@ -291,6 +354,17 @@ def build_relationships_dict(graph):
                     name_to_artists[theme_name.lower()].add(artist_name)
 
         history_parts, other_info_parts, biographies_parts = [], [], []
+        # Transcripts/descriptions are per-video by nature (unlike the
+        # curated history/other_info/biographies, which read as one coherent
+        # artist narrative). Dedupe by text first -- not by (theme, text) --
+        # so the "Instrumental - no lyrics spoken or sung." sentinel shared
+        # by ~18% of rows still collapses to a single line for an artist
+        # with several instrumental videos, rather than repeating once per
+        # video and crowding out real content within the retrieval-time
+        # snippet/slice limit. Distinct transcripts keep their video's theme
+        # as a label so the LLM can attribute a snippet to a specific song.
+        audio_transcription_seen = {}   # text -> first theme it was seen with
+        visual_description_seen = {}
 
         for video_node in _iter_artist_videos(graph, node):
             vdata = graph.nodes[video_node]
@@ -301,10 +375,19 @@ def build_relationships_dict(graph):
             video_entry['history']     = vdata.get('history', '')
             video_entry['other_info']  = vdata.get('other_info', '')
             video_entry['biographies'] = vdata.get('biographies', '')
+            video_entry['audio_transcription'] = vdata.get('audio_transcription', '')
+            video_entry['visual_description']  = vdata.get('visual_description', '')
 
             if vdata.get('history'):     history_parts.append(vdata['history'])
             if vdata.get('other_info'):  other_info_parts.append(vdata['other_info'])
             if vdata.get('biographies'): biographies_parts.append(vdata['biographies'])
+
+            audio = vdata.get('audio_transcription')
+            if audio and audio not in audio_transcription_seen:
+                audio_transcription_seen[audio] = vdata.get('theme') or ''
+            visual = vdata.get('visual_description')
+            if visual and visual not in visual_description_seen:
+                visual_description_seen[visual] = vdata.get('theme') or ''
 
             for entity_type, entity_node in _iter_video_entities(graph, video_node):
                 key = TYPE_KEY.get(entity_type)
@@ -324,6 +407,17 @@ def build_relationships_dict(graph):
         if other_info_parts:  entry['other_info']  = '\n\n'.join(dict.fromkeys(other_info_parts))
         if biographies_parts: entry['biographies'] = '\n\n'.join(dict.fromkeys(biographies_parts))
 
+        if audio_transcription_seen:
+            entry['audio_transcription'] = '\n\n'.join(
+                f"[{theme}] {text}" if theme else text
+                for text, theme in audio_transcription_seen.items()
+            )
+        if visual_description_seen:
+            entry['visual_description'] = '\n\n'.join(
+                f"[{theme}] {text}" if theme else text
+                for text, theme in visual_description_seen.items()
+            )
+
         entry['videos'].sort(key=lambda v: (v['index'] is None, v['index']))
 
         artist_relationships[artist_name] = entry
@@ -336,12 +430,32 @@ def build_artist_projection(graph, entity_types=None, max_entity_share=0.10):
     """
     Projects the heterogeneous knowledge graph onto an artist-artist similarity
     graph. Two artists share an edge if they have common entities, weighted by
-    the inverse of how many artists share each entity (rarity bonus).
-
-
+    a fixed total weight-budget per entity split across every pair that
+    shares it (see the rarity comment below for why, not a plain 1/n bonus).
     """
     if entity_types is None:
+        # Date deliberately excluded: a single recording day can span many
+        # unrelated artists (a festival, a field trip visiting one region),
+        # so it acts as a bridge that merges otherwise-distinct communities
+        # rather than a genuine similarity signal for clustering. It's still
+        # a real entity elsewhere (relationships dict, concept-neighbor
+        # bridging with an explicit "shared date" label) -- just not here,
+        # where it would distort the community structure Leiden finds.
         entity_types = {'Theme', 'Instrument', 'Category', 'Keyword', 'Location'}
+
+    # Keywords that just restate a Region/District/Municipality/Location/
+    # Category/Instrument value as free text (measured: 'Tres-os-Montes',
+    # 'Ribatejo', 'Fado', 'Bombo' etc. all also appear verbatim as Keyword
+    # tags) add no new similarity information -- the connection they encode
+    # is already captured, more precisely, by that other field. Left in the
+    # Keyword pool they'd still double-count the same underlying fact as a
+    # second edge. Scoped to Keyword only: Category/Instrument/etc. are the
+    # authoritative fields being restated, not restatements themselves.
+    redundant_keyword_keys = set()
+    if 'Keyword' in entity_types:
+        for _, data in graph.nodes(data=True):
+            if data.get('type') in ('Region', 'District', 'Municipality', 'Location', 'Category', 'Instrument'):
+                redundant_keyword_keys.add(_canonical_entity_key(data.get('name', '')))
 
     entity_to_artists = defaultdict(set)
     artist_nodes = set()
@@ -357,8 +471,11 @@ def build_artist_projection(graph, entity_types=None, max_entity_share=0.10):
 
         for video_node in _iter_artist_videos(graph, node):
             for entity_type, entity_node in _iter_video_entities(graph, video_node):
-                if entity_type in entity_types:
-                    entity_to_artists[entity_node].add(node)
+                if entity_type not in entity_types:
+                    continue
+                if entity_type == 'Keyword' and _canonical_entity_key(graph.nodes[entity_node].get('name', '')) in redundant_keyword_keys:
+                    continue
+                entity_to_artists[entity_node].add(node)
 
     n_artists = len(artist_nodes)
     threshold = int(n_artists * max_entity_share)
@@ -368,9 +485,22 @@ def build_artist_projection(graph, entity_types=None, max_entity_share=0.10):
         proj.add_node(node, **graph.nodes[node])
 
     for _, artists in entity_to_artists.items():
-        if len(artists) > threshold:
+        n = len(artists)
+        if n < 2 or n > threshold:
             continue
-        rarity = 1.0 / len(artists)
+        # Fixed total-mass budget per entity, not a plain 1/n bonus. Under
+        # 1/n, an entity's TOTAL contributed weight (rarity * C(n,2) pairs)
+        # actually grows as n grows -- pair count grows quadratically while
+        # 1/n only shrinks linearly -- so a keyword shared by 460 artists
+        # injected 230x more total weight into this graph than one shared by
+        # 3 (measured: 229.5 vs 1.0), even though each individual pair's
+        # connection is far less distinctive. This formula gives every
+        # entity, rare or common, the same total weight budget (1.0), so a
+        # common entity's PER-PAIR contribution shrinks quadratically
+        # instead of linearly, and genuinely rare/distinctive shared traits
+        # dominate edge weight (and therefore Leiden clustering) the way
+        # they're supposed to.
+        rarity = 2.0 / (n * (n - 1))
         artists_list = list(artists)
         for i in range(len(artists_list)):
             for j in range(i + 1, len(artists_list)):
@@ -459,7 +589,7 @@ def _build_community_dicts(partition, nx_nodes, artist_proj, full_graph):
         summary_lines.append(f"  Artists: {', '.join(sorted(artists))}")
 
         type_order = ['Category', 'Instrument', 'Theme', 'Keyword',
-                      'Location', 'Municipality', 'District', 'Region']
+                      'Location', 'Municipality', 'District', 'Region', 'Date']
         for t in type_order:
             if t in entity_buckets:
                 top_names = [n for n, _ in entity_buckets[t].most_common(8)]

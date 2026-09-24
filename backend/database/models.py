@@ -60,6 +60,10 @@ class Project(db.Model):
     other_info = db.Column(db.String(2048))
     biographies = db.Column(db.String(2048))
 
+    # video-to-text (results.csv) enrichment
+    audio_transcription = db.Column(db.Text, server_default='')
+    visual_description = db.Column(db.Text, server_default='')
+
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
     def serialize(self):
@@ -89,6 +93,9 @@ class Project(db.Model):
             "history": self.history,
             "other_info": self.other_info,
             "biographies": self.biographies,
+
+            "audio_transcription": self.audio_transcription,
+            "visual_description": self.visual_description,
 
             "created_at": self.created_at.isoformat() if self.created_at else None
         }

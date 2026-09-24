@@ -13,6 +13,7 @@ from ai.rag.knowledgeGraph import (
     build_hierarchical_communities,
 )
 from ai.rag.retrieval import build_text_index
+from ai.rag.embeddings import load_chunk_index
 
 # ==================================================
 # global vars
@@ -30,6 +31,8 @@ class RagState:
     community_hierarchy: dict
     text_token_index: dict
     artist_texts: dict
+    chunk_vectors: object    # numpy matrix, or None if no embeddings cache exists yet
+    chunk_meta: list
 
 
 # ==================================================
@@ -56,13 +59,30 @@ def loadProjectRows():
             'Concelho':      project.municipality,
             'Distrito/Ilha': project.district,
             'Região':        project.region,
+            'Data':          project.date.isoformat() if project.date else None,
             'keywords':      project.keywords,
             'history':       project.history,
             'other_info':    project.other_info,
             'biographies':   project.biographies,
+            'audio_transcription': project.audio_transcription or '',
+            'visual_description':  project.visual_description or '',
         }
         for project in Project.query.all()
     ]
+
+
+def _drop_stale_chunks(chunk_vectors, chunk_meta, artist_relationships):
+    """
+    The chunk embeddings cache is built by a separate, manually-triggered
+    script (database/buildChunkEmbeddings.py) and can lag behind the live
+    projects table. Drop any chunk whose artist no longer exists in the
+    freshly-rebuilt graph so a renamed/removed artist can't surface a
+    dangling reference in the prompt.
+    """
+    keep = [i for i, m in enumerate(chunk_meta) if m['artist_name'] in artist_relationships]
+    if len(keep) == len(chunk_meta):
+        return chunk_vectors, chunk_meta
+    return chunk_vectors[keep], [chunk_meta[i] for i in keep]
 
 
 def _build_state():
@@ -74,12 +94,17 @@ def _build_state():
     community_hierarchy = build_hierarchical_communities(artist_proj, graph)
     text_token_index, artist_texts = build_text_index(artist_relationships)
 
+    chunk_vectors, chunk_meta = load_chunk_index()
+    if chunk_vectors is not None:
+        chunk_vectors, chunk_meta = _drop_stale_chunks(chunk_vectors, chunk_meta, artist_relationships)
+
     total_communities = sum(len(c) for c in community_hierarchy.values())
     print(
         f"[RAG] graph: {graph.number_of_nodes()} nodes, "
         f"{artist_proj.number_of_edges()} artist-artist edges, "
         f"{len(artist_relationships)} artists, "
-        f"{total_communities} communities across {len(community_hierarchy)} levels."
+        f"{total_communities} communities across {len(community_hierarchy)} levels, "
+        f"{len(chunk_meta)} semantic chunks."
     )
 
     return RagState(
@@ -89,6 +114,8 @@ def _build_state():
         community_hierarchy=community_hierarchy,
         text_token_index=text_token_index,
         artist_texts=artist_texts,
+        chunk_vectors=chunk_vectors,
+        chunk_meta=chunk_meta,
     )
 
 

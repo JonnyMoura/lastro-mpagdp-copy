@@ -19,11 +19,14 @@ from ai.rag.retrieval import (
     find_related_artists,
     _search_text_fields,
     _score_communities,
+    _semantic_search,
     _tokenize,
     _is_specific_entity,
+    SEMANTIC_PROMOTE_THRESHOLD,
 )
 from ai.rag.ragQuery import answer_question_with_exploration
 from ai.rag.setup import loadProjectRows
+from ai.rag.embeddings import load_chunk_index
 
 
 def visualize_graph(graph, title="Knowledge Graph"):
@@ -116,10 +119,33 @@ TEST_QUERIES_EN = [
     "Are there any films or documentaries in the archive?",
 ]
 
+# Deliberately avoid literal vocabulary overlap with any expected keyword/
+# category/theme in the archive -- these exist to stress the semantic
+# (Stage 3.5 / embedding) path specifically, not the lexical stages 1-3.
+# The first 5 were validated by hand during the design of the semantic
+# layer (see the plan addendum): before Stage 3.5 existed, all 5 resolved
+# to the same wrong artist (a shared blank-author bucket); the goal here is
+# to confirm Stage 3.5/discovery block C3 keep producing distinct, on-theme
+# hits going forward as the archive/embeddings change over time.
+PARAPHRASE_TEST_QUERIES_PT = [
+    "Que musica fala sobre o cheiro do pao a cozer no forno?",
+    "Ha relatos de saudade de quem foi trabalhar para o estrangeiro?",
+    "Que videos mencionam bruxas ou feiticaria?",
+    "Ha video que mostrem criancas a brincar na rua?",
+    "Que musica transmite um sentimento de perda irreparavel?",
+    # additional paraphrase-style probes, drawn from ragQuery.py's own
+    # validated thematic categories (religion, gastronomy, rural life) but
+    # phrased without the literal category words themselves
+    "Que artistas descrevem rituais ou bencaos praticadas pelos mais velhos?",
+    "Existem historias sobre pratos tipicos passados de geracao em geracao?",
+    "Ha relatos de dificuldades na vida no campo antes da eletricidade chegar?",
+]
+
 
 def _diagnose_exploration(question, artist_relationships, name_to_artists,
                           artist_proj, community_hierarchy,
-                          text_token_index, artist_texts):
+                          text_token_index, artist_texts,
+                          chunk_vectors=None, chunk_meta=None):
     """Runs the exploration pipeline and prints what each stage found."""
     question_lower = question.lower()
     question_tokens = _tokenize(question)
@@ -173,6 +199,19 @@ def _diagnose_exploration(question, artist_relationships, name_to_artists,
     else:
         print(f"  [S3 Text] (no matches)")
 
+    # Stage 3.5: semantic similarity search
+    semantic_hits = _semantic_search(question, chunk_vectors, chunk_meta)
+    if chunk_vectors is None:
+        print(f"  [S3.5 Semantic] (no embeddings cache loaded)")
+    elif semantic_hits:
+        print(f"  [S3.5 Semantic] {len(semantic_hits)} chunks >= discovery threshold:")
+        for score, m in semantic_hits[:5]:
+            promote = ' [PROMOTE]' if score >= SEMANTIC_PROMOTE_THRESHOLD else ''
+            print(f"    score={score:.3f}{promote} [{m['artist_name']}] {m['field']}: "
+                  f"\"{m['text'][:80]}...\"")
+    else:
+        print(f"  [S3.5 Semantic] (no matches above threshold)")
+
     # Stage 4: community
     if not artist_hit and not text_results and community_hierarchy:
         for res in sorted(community_hierarchy.keys(), reverse=True):
@@ -191,10 +230,12 @@ def _diagnose_exploration(question, artist_relationships, name_to_artists,
 
 def run_tests(artist_relationships, name_to_artists, artist_proj,
               community_hierarchy, text_token_index, artist_texts,
-              call_llm=True):
+              chunk_vectors=None, chunk_meta=None,
+              call_llm=True, include_paraphrase=True):
     all_queries = (
         [("PT", q) for q in TEST_QUERIES_PT] +
-        [("EN", q) for q in TEST_QUERIES_EN]
+        [("EN", q) for q in TEST_QUERIES_EN] +
+        ([("PT-paraphrase", q) for q in PARAPHRASE_TEST_QUERIES_PT] if include_paraphrase else [])
     )
 
     print(f"\n{'='*70}")
@@ -208,13 +249,14 @@ def run_tests(artist_relationships, name_to_artists, artist_proj,
             question, artist_relationships, name_to_artists,
             artist_proj, community_hierarchy,
             text_token_index, artist_texts,
+            chunk_vectors=chunk_vectors, chunk_meta=chunk_meta,
         )
 
         if call_llm:
             answer = answer_question_with_exploration(
                 question, artist_relationships, name_to_artists,
-                artist_proj, community_hierarchy,
-                text_token_index, artist_texts,
+                community_hierarchy, text_token_index, artist_texts,
+                chunk_vectors=chunk_vectors, chunk_meta=chunk_meta,
             )
             print(f"\n  --- LLM Answer ---\n{answer}\n  --- End ---")
 
@@ -248,6 +290,7 @@ if __name__ == '__main__':
             community_hierarchy = build_hierarchical_communities(artist_proj, graph)
 
             text_token_index, artist_texts = build_text_index(artist_relationships)
+            chunk_vectors, chunk_meta = load_chunk_index()
 
             total_communities = sum(len(c) for c in community_hierarchy.values())
             print(f"Graph: {graph.number_of_nodes()} nodes | "
@@ -255,7 +298,8 @@ if __name__ == '__main__':
                   f"{len(artist_relationships)} artists indexed | "
                   f"{total_communities} communities across {len(community_hierarchy)} levels | "
                   f"{len(artist_texts)} artists with text | "
-                  f"{len(text_token_index)} text tokens indexed.")
+                  f"{len(text_token_index)} text tokens indexed | "
+                  f"{len(chunk_meta)} semantic chunks loaded.")
 
             for res, comms in sorted(community_hierarchy.items()):
                 print(f"  Resolution {res}: {len(comms)} communities")
@@ -263,4 +307,5 @@ if __name__ == '__main__':
             call_llm = '--no-llm' not in sys.argv
             run_tests(artist_relationships, name_to_artists, artist_proj,
                       community_hierarchy, text_token_index, artist_texts,
+                      chunk_vectors=chunk_vectors, chunk_meta=chunk_meta,
                       call_llm=call_llm)
