@@ -15,12 +15,16 @@ from database.setup import initDatabase, cleanInteractions
 from database.fetchData import fetchCSV
 from database.models import Project, Interaction
 
+from ai.rag.setup import initRag
+from ai.rag.ragQuery import answerExplorationQuestion
+
 from utilities.scheduler.setup import initScheduler, cleanScheduler
 from utilities.cors.setup import initCors
 from utilities.ratelimit.setup import initRateLimiter, limiter
 
 app = Flask(__name__)
 initDatabase(app)
+initRag(app)
 initCors(app)
 initRateLimiter(app)
 initScheduler(app)
@@ -55,6 +59,100 @@ def get_suggestions(project_id):
 @limiter.limit("20 per minute")
 def handle_query():
     return jsonify(handleQuery(request.json))
+
+EXPLORE_ANSWER_PAGE = """
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Explore - Lastro</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: -apple-system, BlinkMacSystemFont, 'Geist', 'Segoe UI', system-ui, sans-serif;
+        background-color: #080808;
+        color: #e0e0e0;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        padding: 40px 20px;
+    }
+    .container { width: 100%; max-width: 640px; }
+    h1 { font-size: 20px; margin-bottom: 16px; font-weight: 500; }
+    textarea {
+        width: 100%; min-height: 90px; padding: 12px; border-radius: 8px;
+        border: 1px solid #333; background: #141414; color: #e0e0e0;
+        font-size: 15px; resize: vertical; font-family: inherit;
+    }
+    button {
+        margin-top: 12px; padding: 10px 20px; border-radius: 8px; border: none;
+        background: #e0e0e0; color: #080808; font-size: 14px; font-weight: 600;
+        cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    #answer {
+        margin-top: 24px; white-space: pre-wrap; line-height: 1.5;
+        border-top: 1px solid #222; padding-top: 20px; display: none;
+    }
+    #status { margin-top: 12px; color: #888; font-size: 14px; }
+</style>
+</head>
+<body>
+<div class="container">
+    <h1>Explore o arquivo (RAG + Knowledge Graph)</h1>
+    <textarea id="question" placeholder="Ex: Quem toca gaita de foles?"></textarea>
+    <br>
+    <button id="ask">Perguntar</button>
+    <div id="status"></div>
+    <div id="answer"></div>
+</div>
+<script>
+    const btn = document.getElementById('ask');
+    const questionEl = document.getElementById('question');
+    const statusEl = document.getElementById('status');
+    const answerEl = document.getElementById('answer');
+
+    async function ask() {
+        const question = questionEl.value.trim();
+        if (!question) return;
+        btn.disabled = true;
+        statusEl.textContent = 'A pensar... (pode demorar ate 2 minutos)';
+        answerEl.style.display = 'none';
+
+        try {
+            const res = await fetch('/explore-answer', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ question })
+            });
+            const data = await res.json();
+            answerEl.textContent = data.answer || JSON.stringify(data);
+            answerEl.style.display = 'block';
+            statusEl.textContent = '';
+        } catch (e) {
+            statusEl.textContent = 'Erro: ' + e;
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    btn.addEventListener('click', ask);
+    questionEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) ask();
+    });
+</script>
+</body>
+</html>
+"""
+
+@app.route('/explore-answer', methods=['GET', 'POST'])
+@limiter.limit("20 per minute", methods=["POST"])
+def explore_answer():
+    if request.method == 'GET':
+        return Response(EXPLORE_ANSWER_PAGE, mimetype='text/html')
+    question = request.json.get("question", "")
+    return jsonify({"answer": answerExplorationQuestion(question)})
 
 @app.route('/fetch-csv')
 @limiter.limit("20 per minute")

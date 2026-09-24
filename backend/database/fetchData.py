@@ -164,6 +164,7 @@ def updateProject(existingProject, p, lineIndex, cleanedLink, reporter):
         ('region', p['Região'] if isinstance(p['Região'], str) else ''),
         ('instruments', normalizeString(p['Instrumentos'])),
         
+        
         ('instruments', normalizeString(p['Instrumentos'])),
         
         ('keywords', normalizeString(concatStrings([p['Palavras-chave'],p['Conceitos-chave']]), capitalize_keywords=True)),

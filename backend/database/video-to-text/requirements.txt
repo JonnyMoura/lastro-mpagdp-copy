@@ -1,0 +1,8 @@
+pandas~=3.0.3
+yt-dlp
+google-genai
+google
+openpyxl
+dotenv
+python-dotenv~=1.2.2
+pydantic~=2.13.4

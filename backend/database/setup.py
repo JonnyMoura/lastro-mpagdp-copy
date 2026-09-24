@@ -4,6 +4,7 @@
 '''
 
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from sqlalchemy.pool import QueuePool
 import sqlite3
 import os
@@ -44,16 +45,36 @@ def initDatabase(app):
 
         with app.app_context():
             db.create_all()
+            _ensure_project_columns()
 
             from database.models import Project
             from database.fetchData import fetchCSV
-            
+
             if Project.query.count() == 0:
                 fetchCSV()
 
 # ==================================================
 # other methods
 # ==================================================
+
+def _ensure_project_columns():
+    """
+    db.create_all() only creates missing tables, not missing columns on an
+    already-existing SQLite table. DEFAULT '' makes SQLite backfill existing
+    rows with '' instead of NULL, matching history/other_info/biographies.
+    Idempotent: safe to call on every startup.
+    """
+    required_columns = {
+        'audio_transcription': "TEXT DEFAULT ''",
+        'visual_description':  "TEXT DEFAULT ''",
+    }
+    with db.engine.connect() as conn:
+        existing = {row[1] for row in conn.execute(text("PRAGMA table_info(projects)"))}
+        for col_name, col_def in required_columns.items():
+            if col_name not in existing:
+                conn.execute(text(f"ALTER TABLE projects ADD COLUMN {col_name} {col_def}"))
+                print(f"[DB] Added missing column: projects.{col_name}")
+        conn.commit()
 
 def getConnection():
     conn = sqlite3.connect(dbPath)
